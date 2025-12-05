@@ -2,47 +2,20 @@ import sqlite3
 import re
 from datetime import datetime, date
 
+import configHandler
+
 
 def create_database():
-    """Создает базу данных и таблицу"""
-    conn = sqlite3.connect('habr_vacancies.db')
+    conn = sqlite3.connect(configHandler.db_name)
     cursor = conn.cursor()
 
-    # Удаляем старую таблицу если существует
-    cursor.execute('DROP TABLE IF EXISTS vacancies')
+    def load_sql_file(file_path: str) -> str:
+        """Загружает SQL из файла"""
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return f.read()
 
-    # Создаем таблицу с улучшенной структурой
-    cursor.execute('''
-                   CREATE TABLE vacancies
-                   (
-                       id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-                       date_posted           TEXT,    -- Оригинальная дата, например "3 декабря"
-                       date_posted_timestamp DATE,    -- Дата в формате timestamp (2025-12-03)
-                       company_name          TEXT,
-                       company_rating        REAL,
-                       vacancy_title         TEXT,
-                       location              TEXT,
-                       employment_type       TEXT,
-                       remote_option         BOOLEAN,
+    cursor.execute(load_sql_file("db_schemas/vacancies.sql"))
 
-                       -- Поля для зарплаты
-                       salary_text           TEXT,
-                       salary_min            INTEGER,
-                       salary_max            INTEGER,
-                       salary_currency       TEXT,
-                       is_exact_salary       BOOLEAN, -- True = точная зарплата, False = похожие специалисты
-
-                       skills                TEXT,
-                       scraped_date          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                   )
-                   ''')
-
-    # Создаем индексы для быстрого поиска
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_company ON vacancies(company_name)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_title ON vacancies(vacancy_title)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_salary ON vacancies(salary_min, salary_max)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_date ON vacancies(date_posted_timestamp)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_exact_salary ON vacancies(is_exact_salary)')
 
     conn.commit()
     return conn
@@ -337,22 +310,103 @@ def insert_vacancies(conn, data):
     print(f"✅ Добавлено {len(data)} записей в базу данных")
 
 
-def export_to_csv(conn, filename='vacancies.csv'):
-    """Экспорт данных в CSV"""
-    import csv
-
+def get_vacancies(conn, num):
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM vacancies")
 
-    with open(filename, 'w', newline='', encoding='utf-8') as file:
-        writer = csv.writer(file)
+    cursor.execute(f'''
+    SELECT * FROM vacancies WHERE match_score is null
+    limit {num}
+    ''')
 
-        # Заголовки
-        writer.writerow([description[0] for description in cursor.description])
+    rows = cursor.fetchall()
+    col_names = [description[0] for description in cursor.description]
 
-        # Данные
-        writer.writerows(cursor.fetchall())
+    # Компактный вариант с list comprehension
+    vacancies = [dict(zip(col_names, row)) for row in rows]
 
-    print(f"📄 Данные экспортированы в {filename}")
+    return vacancies
+
+
+def update_vacancies(conn, vacancies):
+    """
+    Обновляет вакансии в базе данных с результатами анализа GigaChat.
+
+    Args:
+        conn: соединение с базой данных
+        vacancies: список словарей с результатами анализа
+    """
+    cursor = conn.cursor()
+
+    updated_count = 0
+
+    for vacancy in vacancies:
+        try:
+            # Проверяем, есть ли необходимые поля
+            if 'id' not in vacancy:
+                print(f"⚠️ Вакансия без ID, пропускаем: {vacancy.get('vacancy_title', 'Без названия')}")
+                continue
+
+            # Преобразуем списки в строки JSON для хранения в базе
+            missing_skills = vacancy.get('missing_skills', [])
+            redundant_skills = vacancy.get('redundant_skills', [])
+            recommendations = vacancy.get('recommendations', [])
+
+            # Преобразуем в JSON строки, если это списки
+            import json
+
+            if isinstance(missing_skills, list):
+                missing_skills_str = json.dumps(missing_skills, ensure_ascii=False)
+            else:
+                missing_skills_str = str(missing_skills) if missing_skills else None
+
+            if isinstance(redundant_skills, list):
+                redundant_skills_str = json.dumps(redundant_skills, ensure_ascii=False)
+            else:
+                redundant_skills_str = str(redundant_skills) if redundant_skills else None
+
+            if isinstance(recommendations, list):
+                recommendations_str = json.dumps(recommendations, ensure_ascii=False)
+            else:
+                recommendations_str = str(recommendations) if recommendations else None
+
+            # SQL запрос для обновления
+            cursor.execute('''
+                           UPDATE vacancies
+                           SET match_score      = ?,
+                               is_relevant      = ?,
+                               missing_skills   = ?,
+                               redundant_skills = ?,
+                               analysis         = ?,
+                               recommendations  = ?
+                           WHERE id = ?
+                           ''', (
+                               vacancy.get('match_score'),
+                               vacancy.get('is_relevant'),
+                               missing_skills_str,
+                               redundant_skills_str,
+                               vacancy.get('analysis', ''),
+                               recommendations_str,
+                               vacancy['id']
+                           ))
+
+            if cursor.rowcount > 0:
+                updated_count += 1
+                print(f"✅ Обновлена вакансия ID {vacancy['id']}: {vacancy.get('vacancy_title', 'Без названия')}")
+            else:
+                print(f"⚠️ Вакансия ID {vacancy['id']} не найдена в базе")
+
+        except KeyError as e:
+            print(f"❌ Ошибка ключа при обновлении вакансии: {e}")
+            print(f"   Данные вакансии: {vacancy}")
+        except Exception as e:
+            print(f"❌ Ошибка при обновлении вакансии ID {vacancy.get('id', 'Unknown')}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # Сохраняем изменения
+    conn.commit()
+    print(f"\n📊 Итого обновлено вакансий: {updated_count}")
+
+    return updated_count
 
 
